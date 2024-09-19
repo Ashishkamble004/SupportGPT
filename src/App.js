@@ -6,17 +6,19 @@ import axios from 'axios';
 import './App.css';
 
 // Configure Amplify
+import config from './config';
+
 Amplify.configure({
   Auth: {
-    region: process.env.REACT_APP_REGION,
-    userPoolId: process.env.REACT_APP_USER_POOL_ID,
-    userPoolWebClientId: process.env.REACT_APP_USER_POOL_CLIENT_ID,
+    region: config.REGION,
+    userPoolId: config.USER_POOL_ID,
+    userPoolWebClientId: config.USER_POOL_CLIENT_ID,
   },
   API: {
     endpoints: [
       {
         name: 'SupportGPTApi',
-        endpoint: process.env.REACT_APP_API_GATEWAY_URL,
+        endpoint: config.API_GATEWAY_URL,
       },
     ],
   },
