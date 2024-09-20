@@ -1,0 +1,870 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Support Case Processing and Summarization with Cognito and API Gateway'
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket for storing support cases
+
+  DynamoDBTableName:
+    Type: String
+    Description: Name of the DynamoDB table for tracking processed cases
+
+  CasesPerFile:
+    Type: Number
+    Description: Number of cases to include in each S3 file
+    Default: 10
+
+  BedrockModelId:
+    Type: String
+    Description: Bedrock model ID for summarization
+    Default: anthropic.claude-3-sonnet-20240229-v1:0
+
+  MaxTokens:
+    Type: Number
+    Description: Maximum number of tokens for summarization
+    Default: 2000
+
+  CognitoUserPoolName:
+    Type: String
+    Description: Name for the Cognito User Pool
+
+  AWSRegion:
+    Type: String
+    Description: The AWS region to deploy the resources
+    Default: us-east-1
+   
+  AllowedOrigins:
+    Type: String
+    Description: Comma-separated list of allowed origins for CORS
+    Default: "*"
+
+  WafRuleLimit:
+    Type: Number
+    Description: The maximum number of requests allowed in 5 minutes from an IP
+    Default: 100
+  
+  CreateEventBridgeRule:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  ShouldCreateEventBridgeRule: !Equals [!Ref CreateEventBridgeRule, 'true']
+
+Resources:
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DynamoDBTableName
+      AttributeDefinitions:
+        - AttributeName: CaseId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: CaseId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  LambdaGetCasesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lambda-getcases
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaGetCasesRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+          import os
+
+          S3_BUCKET_NAME = os.environ['S3_BUCKET_NAME']
+          DYNAMODB_TABLE_NAME = os.environ['DYNAMODB_TABLE_NAME']
+          CASES_PER_FILE = int(os.environ.get('CASES_PER_FILE', '10'))
+
+          def lambda_handler(event, context):
+              #    # Create AWS clients
+          support_client = boto3.client('support', region_name=AWS_REGION)
+          dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
+          s3 = boto3.client('s3', region_name=AWS_REGION)
+
+          def get_last_processed_case_id():
+              table = dynamodb.Table(DYNAMODB_TABLE_NAME)
+              try:
+                  response = table.get_item(Key={'CaseId': 'LastProcessedCaseId'})
+                  item = response.get('Item')
+                  if item:
+                      return item.get('LastProcessedCaseId')
+                  else:
+                      print("No last processed case ID found in DynamoDB.")
+                      return None
+              except ClientError as e:
+                  print(f"Error retrieving last processed case ID from DynamoDB: {e.response['Error']['Code']} - {e.response['Error']['Message']}")
+              except Exception as e:
+                  print(f"Unexpected error retrieving last processed case ID from DynamoDB: {e}")
+              return None
+
+          def store_last_processed_case_id(case_id):
+              table = dynamodb.Table(DYNAMODB_TABLE_NAME)
+              try:
+                  table.put_item(
+                      Item={
+                          'CaseId': 'LastProcessedCaseId',
+                          'LastProcessedCaseId': case_id
+                      }
+                  )
+                  print(f"Stored last processed case ID: {case_id}")
+              except ClientError as e:
+                  print(f"Error storing last processed case ID: {e.response['Error']['Code']} - {e.response['Error']['Message']}")
+                  raise  # Re-raise the exception to handle it in the main function
+
+          def get_case_communications(case_id):
+              try:
+                  print(f"Retrieving communications for Case ID: {case_id}")
+                  response = support_client.describe_communications(caseId=case_id)
+                  communications = response.get('communications', [])
+                  print(f"Retrieved {len(communications)} communications")
+                  if not communications:
+                      print(f"No communications found for Case ID: {case_id}")
+                      return ""
+                  case_text = "\n\n".join(comm.get('body', '') for comm in communications)
+                  print(f"Total length of communications: {len(case_text)} characters")
+                  return case_text
+              except ClientError as e:
+                  print(f"AWS Client Error for Case ID {case_id}: {e.response['Error']['Code']} - {e.response['Error']['Message']}")
+              except Exception as e:
+                  print(f"Error retrieving communications for Case ID {case_id}: {e}")
+              return ""
+
+          def write_cases_to_s3(cases_data):
+              file_content = StringIO()
+              for case_id, case_text in cases_data.items():
+                  file_content.write(f"Case ID: {case_id}\n\n")
+                  file_content.write(case_text)
+                  file_content.write("\n\n" + "="*50 + "\n\n")
+              
+              file_name = f"cases_{'-'.join(cases_data.keys())}.txt"
+              try:
+                  s3.put_object(Bucket=S3_BUCKET_NAME, Key=file_name, Body=file_content.getvalue())
+                  print(f"Successfully uploaded file {file_name} to S3 bucket {S3_BUCKET_NAME}")
+              except ClientError as e:
+                  print(f"Error uploading file to S3: {e}")
+              return file_name
+
+          def parse_case_id(case_id):
+              try:
+                  if case_id.startswith('case-'):
+                      case_id_part = case_id.split('-', 1)[1]
+                      return datetime.datetime.fromisoformat(case_id_part)
+              except (ValueError, IndexError):
+                  print(f"Invalid case ID format: {case_id}")
+              return None
+
+          def get_support_cases(last_processed_case_id):
+              kwargs = {'includeResolvedCases': True, 'maxResults': 100}
+              if last_processed_case_id:
+                  case_datetime = parse_case_id(last_processed_case_id)
+                  if case_datetime:
+                      kwargs['afterTime'] = case_datetime.isoformat()
+                  else:
+                      print(f"Unable to parse last processed case ID: {last_processed_case_id}")
+
+              while True:
+                  response = support_client.describe_cases(**kwargs)
+                  yield from response.get('cases', [])
+
+                  next_token = response.get('nextToken')
+                  if not next_token:
+                      break
+                  kwargs['nextToken'] = next_token
+
+          last_processed_case_id = get_last_processed_case_id()
+          try:
+              print("Attempting to retrieve support cases...")
+              cases_data = {}
+              s3_file_names = []
+
+              for case in get_support_cases(last_processed_case_id):
+                  case_id = case.get('caseId', 'N/A')
+                  print(f"\nProcessing Case ID: {case_id}")
+
+                  case_text = get_case_communications(case_id)
+                  if case_text:
+                      cases_data[case_id] = case_text
+
+                  if len(cases_data) == CASES_PER_FILE:
+                      s3_file_name = write_cases_to_s3(cases_data)
+                      s3_file_names.append(s3_file_name)
+                      cases_data = {}  # Reset for the next batch
+
+                      # Store the last processed case ID in DynamoDB
+                      store_last_processed_case_id(case_id)
+
+              # Write any remaining cases
+              if cases_data:
+                  s3_file_name = write_cases_to_s3(cases_data)
+                  s3_file_names.append(s3_file_name)
+                  store_last_processed_case_id(list(cases_data.keys())[-1])
+
+              if not s3_file_names:
+                  print("No new cases found after the last processed case ID.")
+                  return {'statusCode': 200, 'body': json.dumps('No new cases to process')}
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'s3_file_names': s3_file_names})
+              }
+
+          except ClientError as e:
+              error_code = e.response['Error']['Code']
+              error_message = e.response['Error']['Message']
+              print(f"AWS Client Error: {error_code} - {error_message}")
+              return {
+                  'statusCode': 500,
+                  'body': json.dumps(f"Error: {error_code} - {error_message}")
+              }
+          except Exception as e:
+              print(f"Unexpected error: {e}")
+              return {
+                  'statusCode': 500,
+                  'body': json.dumps(f"Unexpected error: {str(e)}")
+              }
+
+              pass
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref S3Bucket
+          DYNAMODB_TABLE_NAME: !Ref DynamoDBTable
+          CASES_PER_FILE: !Ref CasesPerFile
+
+  LambdaGetCasesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${LambdaGetCasesFunction}"
+      RetentionInDays: 14
+  
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Condition: ShouldCreateEventBridgeRule
+    Properties:
+      Description: "EventBridge rule to trigger Lambda function once a week"
+      ScheduleExpression: "rate(7 days)"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt LambdaGetCasesFunction.Arn
+          Id: "TargetLambdaGetCasesFunction"
+
+
+  LambdaGetCasesFunctionEventInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: ShouldCreateEventBridgeRule
+    Properties:
+      FunctionName: !Ref LambdaGetCasesFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt EventBridgeRule.Arn
+
+  LambdaGetCasesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaGetCasesPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::${S3Bucket}/*
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt DynamoDBTable.Arn
+              - Effect: Allow
+                Action:
+                  - support:DescribeCases
+                  - support:DescribeCommunications
+                Resource: '*'
+
+  SupportCasesKnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: SupportCasesKnowledgeBase
+      Description: Knowledge base for support cases
+      RoleArn: !GetAtt SupportCasesKnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v1"
+      StorageConfiguration:
+        Type: OPENSEARCH_SERVERLESS
+        OpensearchServerlessConfiguration:
+          CollectionArn: !Sub "arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/${OpenSearchCollection}"
+          VectorIndexName: "support-cases-index"
+          FieldMapping:
+           VectorField: "case_vector"
+           TextField: "case_text"
+           MetadataField: "case_metadata"
+
+  SupportCasesDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref SupportCasesKnowledgeBase
+      Name: SupportCasesDataSource
+      Description: Data source for support cases
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt S3Bucket.Arn
+
+  OpenSearchCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    Properties:
+      Name: SupportCasesCollection
+      Type: VECTOR
+
+  SupportCasesKnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SupportCasesKnowledgeBasePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt S3Bucket.Arn
+                  - !Sub '${S3Bucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - bedrock:StartDataSourceSyncJob
+                  - bedrock:GetDataSourceSyncJob
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: !Sub "arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/${OpenSearchCollection}"
+
+  BedrockInvocationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: bedrock-invocation
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Role: !GetAtt BedrockInvocationRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from botocore.exceptions import ClientError, BotoCoreError
+
+          AWS_REGION = os.environ['AWS_REGION']
+          BEDROCK_MODEL_ID = os.environ.get('BEDROCK_MODEL_ID')
+          MAX_TOKENS = int(os.environ.get('MAX_TOKENS', '2000'))
+          KNOWLEDGE_BASE_ID = os.environ['KNOWLEDGE_BASE_ID']
+
+          bedrock_runtime = boto3.client('bedrock-runtime', region_name=AWS_REGION)
+          bedrock_agent_runtime = boto3.client('bedrock-agent-runtime', region_name=AWS_REGION)
+
+          def lambda_handler(event, context):
+              try:
+                  body = json.loads(event['body'])
+                  user_input = body['query']
+
+                  request_payload = {
+                      "anthropic_version": "bedrock-2023-05-31",
+                      "max_tokens": MAX_TOKENS,
+                      "temperature": 0,
+                      "messages": [
+                          {
+                            "role": "system",
+                            "content": "You are an AI assistant for summarizing support cases. The user might ask for issues such as Ec2 not able to connect, Your task is to understand the user query & search the knowledgebase containing cases & find cases having similarities to provide a concise summary of correspondence of those cases and highlight the resolution steps that the user can try. Along with it, also provide the CaseID or CaseID's if multiple, that were used to generate the response."
+                          },
+                          {
+                              "role": "user",
+                              "content": user_input
+                          }
+                      ]
+                  }
+
+                  response = bedrock_agent_runtime.retrieve_and_generate(
+                      knowledgeBaseId=KNOWLEDGE_BASE_ID,
+                      modelId=BEDROCK_MODEL_ID,
+                      contentType="application/json",
+                      accept="application/json",
+                      body=json.dumps(request_payload)
+                  )
+
+                  response_body = json.loads(response['body'].read())
+                  summary = response_body['content'][0]['text']
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'summary': summary})
+                  }
+
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Environment:
+        Variables:
+          AWS_REGION: !Ref AWSRegion
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          MAX_TOKENS: !Ref MaxTokens
+          KNOWLEDGE_BASE_ID: !GetAtt SupportCasesKnowledgeBase.KnowledgeBaseId
+
+  BedrockInvocationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${BedrockInvocationFunction}"
+      RetentionInDays: 14
+
+  BedrockInvocationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock-agent-runtime:RetrieveAndGenerate
+                Resource: '*'
+
+  BedrockCustomResourceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.8
+      Handler: index.handler
+      Role: !GetAtt BedrockCustomResourceRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+              bedrock_client = boto3.client('bedrock')
+              
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      # Attach role to knowledge base
+                      bedrock_client.associate_knowledge_base_role(
+                          knowledgeBaseId=event['ResourceProperties']['KnowledgeBaseId'],
+                          roleArn=event['ResourceProperties']['RoleArn']
+                      )
+                      
+                      # Create data source sync
+                      bedrock_client.create_data_source_sync_job(
+                          knowledgeBaseId=event['ResourceProperties']['KnowledgeBaseId'],
+                          dataSourceConfiguration={
+                              's3Configuration': {
+                                  'bucketArn': event['ResourceProperties']['BucketArn']
+                              }
+                          },
+                          scheduleConfiguration={
+                              'type': 'RECURRING',
+                              'recurringConfiguration': {
+                                  'frequency': 'HOURLY'
+                              }
+                          }
+                      )
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  BedrockCustomResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:AssociateKnowledgeBaseRole
+                  - bedrock:CreateDataSourceSyncJob
+                Resource: '*'
+
+  BedrockCustomResource:
+    Type: Custom::BedrockResource
+    Properties:
+      ServiceToken: !GetAtt BedrockCustomResourceFunction.Arn
+      KnowledgeBaseId: !GetAtt SupportCasesKnowledgeBase.KnowledgeBaseId
+      RoleArn: !GetAtt SupportCasesKnowledgeBaseRole.Arn
+      BucketArn: !GetAtt S3Bucket.Arn
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Ref CognitoUserPoolName
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ClientName: SupportGPTClient
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  AmplifyServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: amplify.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AmplifyParameters
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameters
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/amplify/github-token'
+
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: SupportGPTApp
+      Repository: https://github.com/AshishKamble004/SupportGPT.git
+      AccessToken: '{{resolve:ssm-secure:/amplify/github-token:1}}'
+      IAMServiceRole: !GetAtt AmplifyServiceRole.Arn
+      BuildSpec: |
+        version: 1
+        frontend:
+          phases:
+            preBuild:
+              commands:
+                - npm ci
+            build:
+              commands:
+                - npm run build
+                - echo "window.REACT_APP_REGION='${REACT_APP_REGION}'" >> build/config.js
+                - echo "window.REACT_APP_USER_POOL_ID='${REACT_APP_USER_POOL_ID}'" >> build/config.js
+                - echo "window.REACT_APP_USER_POOL_CLIENT_ID='${REACT_APP_USER_POOL_CLIENT_ID}'" >> build/config.js
+                - echo "window.REACT_APP_API_GATEWAY_URL='${REACT_APP_API_GATEWAY_URL}'" >> build/config.js
+          artifacts:
+            baseDirectory: build
+            files:
+              - '**/*'
+          cache:
+            paths:
+              - node_modules/**/*
+      CustomRules:
+        - Source: '</^[^.]+$|\.(?!(css|gif|ico|jpg|js|png|txt|svg|woff|ttf)$)([^.]+$)/>'
+          Target: '/index.html'
+          Status: '200'
+      EnvironmentVariables:
+        - Name: REACT_APP_REGION
+          Value: !Ref AWS::Region
+        - Name: REACT_APP_USER_POOL_ID
+          Value: !Ref CognitoUserPool
+        - Name: REACT_APP_USER_POOL_CLIENT_ID
+          Value: !Ref CognitoUserPoolClient
+        - Name: REACT_APP_API_GATEWAY_URL
+          Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod
+
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: main
+      EnableAutoBuild: true
+  
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: SupportGPTApi
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiGatewayRootMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !GetAtt ApiGateway.RootResourceId
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt BedrockInvocationFunction.Arn
+
+  ApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: summarize
+
+  ApiGatewayAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoAuthorizer
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      RestApiId: !Ref ApiGateway
+      ProviderARNs:
+        - !GetAtt CognitoUserPool.Arn
+  
+  ApiGatewayCorsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+            method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigins}'"
+          ResponseTemplates:
+            application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+      - StatusCode: 200
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: true
+          method.response.header.Access-Control-Allow-Methods: true
+          method.response.header.Access-Control-Allow-Origin: true
+        ResponseModels:
+          application/json: 'Empty'
+      ResourceId: !Ref ApiGatewayResource
+      RestApiId: !Ref ApiGateway
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiGatewayRootMethod
+      - ApiGatewayCorsMethod
+      - ApiGatewayResource
+    Properties:
+      RestApiId: !Ref ApiGateway
+  
+  ApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ApiGatewayDeployment
+      RestApiId: !Ref ApiGateway
+      StageName: prod
+
+
+  WAFWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: SupportGPTWebACL
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: SupportGPTWebACLMetric
+      Rules:
+        - Name: LimitRequests
+          Priority: 1
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: LimitRequestsRule
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref WafRuleLimit
+              AggregateKeyType: IP
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSetMetric
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+
+  WAFWebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    DependsOn: 
+    - WAFWebACL
+    - ApiGatewayStage  
+    Properties:
+      ResourceArn: !Sub arn:aws:apigateway:${AWS::Region}::/restapis/${ApiGateway}/stages/prod
+      WebACLArn: !GetAtt WAFWebACL.Arn
+
+  WAFLoggingConfiguration:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Properties:
+      ResourceArn: !GetAtt WAFWebACL.Arn
+      LogDestinationConfigs:
+        - !GetAtt WAFLogGroup.Arn
+      RedactedFields:
+        - SingleHeader:
+            Name: authorization
+
+  WAFLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/waf/SupportGPTWebACL
+      RetentionInDays: 30
+
+  ApiGatewayUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      Description: Usage plan for SupportGPT API
+      UsagePlanName: SupportGPTUsagePlan
+      ApiStages:
+        - ApiId: !Ref ApiGateway
+          Stage: !Ref ApiGatewayStage
+
+  ApiGatewayApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Enabled: true
+      Name: SupportGPTApiKey
+      
+
+  ApiGatewayUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiGatewayApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiGatewayUsagePlan
+
+Outputs:
+  LambdaGetCasesFunctionArn:
+    Description: ARN of the Lambda Get Cases Function
+    Value: !GetAtt LambdaGetCasesFunction.Arn
+
+  EventBridgeRuleArn:
+    Description: ARN of the EventBridge Rule
+    Value: !GetAtt EventBridgeRule.Arn
+
+  BedrockInvocationFunctionArn:
+    Description: ARN of the Bedrock Invocation Function
+    Value: !GetAtt BedrockInvocationFunction.Arn
+
+  S3BucketName:
+    Description: Name of the S3 Bucket
+    Value: !Ref S3Bucket
+
+  DynamoDBTableName:
+    Description: Name of the DynamoDB Table
+    Value: !Ref DynamoDBTable
+
+  CognitoUserPoolId:
+    Description: ID of the Cognito User Pool
+    Value: !Ref CognitoUserPool
+
+  CognitoUserPoolClientId:
+    Description: ID of the Cognito User Pool Client
+    Value: !Ref CognitoUserPoolClient
+
+  AmplifyAppId:
+    Description: Amplify App ID
+    Value: !GetAtt AmplifyApp.AppId
+
+  AmplifyAppURL:
+    Description: Amplify App URL
+    Value: !Sub https://${AmplifyBranch.BranchName}.${AmplifyApp.DefaultDomain}
+
+  WAFWebACLArn:
+    Description: ARN of the WAF Web ACL
+    Value: !GetAtt WAFWebACL.Arn
+
+  WAFWebACLId:
+    Description: ID of the WAF Web ACL
+    Value: !Ref WAFWebACL
+
+  ApiGatewayApiKey:
+    Description: API Key for the SupportGPT API
+    Value: !Ref ApiGatewayApiKey
+  
+  ApiGatewayUrl:
+    Description: URL of the API Gateway endpoint
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/
