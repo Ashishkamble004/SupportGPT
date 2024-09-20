@@ -44,6 +44,11 @@ Parameters:
     Description: The maximum number of requests allowed in 5 minutes from an IP
     Default: 100
   
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: GitHub Personal Access Token
+    
   CreateEventBridgeRule:
     Type: String
     Default: 'true'
@@ -601,7 +606,7 @@ Resources:
     Properties:
       Name: SupportGPTApp
       Repository: https://github.com/AshishKamble004/SupportGPT.git
-      AccessToken: '{{resolve:ssm-secure:/amplify/github-token:1}}'
+      AccessToken: !Ref GitHubToken
       IAMServiceRole: !GetAtt AmplifyServiceRole.Arn
       BuildSpec: |
         version: 1
